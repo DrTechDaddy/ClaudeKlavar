@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIDI Score Builder</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/build/Midi.js"></script>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 0; background: #faf8f3; color: #222; }
+  header { padding: 12px 20px; display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+           border-bottom: 1px solid #ddd; background: #fff; position: sticky; top: 0; z-index: 1; }
+  header label { display: flex; gap: 6px; align-items: center; }
+  #drop { border: 2px dashed #bbb; border-radius: 8px; padding: 6px 14px; cursor: pointer; }
+  #drop.over { border-color: #c0392b; background: #fdf0ee; }
+  #info { color: #666; }
+  #score { padding: 20px; overflow: auto; }
+  .tip { position: fixed; pointer-events: none; background: #222; color: #fff; padding: 4px 8px;
+         border-radius: 4px; font-size: 12px; opacity: 0; }
+
+  /* ---- print ---- */
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  #printArea { display: none; }
+  .page { display: flex; flex-direction: column; box-sizing: border-box; overflow: hidden; background: #fff; font: 11px system-ui, sans-serif; color: #222; }
+  .page .ph { display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+              border-bottom: 1px solid #999; padding-bottom: 3px; margin-bottom: 4px; }
+  .page .ph b { font-size: 14px; }
+  .page .legend { display: flex; flex-wrap: wrap; gap: 3px 10px; align-items: center; color: #555; font-size: 9.5px; margin-bottom: 4px; }
+  .page .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 3px; vertical-align: -1px; }
+  .page svg { display: block; }
+  @media print {
+    body { background: #fff; }
+    header, #score, .tip { display: none !important; }
+    #printArea { display: block; }
+    .page { break-after: page; }
+    .page:last-child { break-after: auto; }
+  }
+</style>
+<style id="pagestyle"></style>
+</head>
+<body>
+<header>
+  <div id="drop">Drop a .mid or .json file, or click to choose</div>
+  <input id="file" type="file" accept=".mid,.midi,.json" hidden>
+  <button id="demo">Load demo</button>
+  <label>Direction
+    <select id="orient">
+      <option value="vertical" selected>vertical (bottom → top)</option>
+      <option value="horizontal">horizontal (left → right)</option>
+    </select>
+  </label>
+  <label>Bars / column <input id="bpl" type="number" min="1" max="64" value="8" style="width:50px"></label>
+  <label>Beat size <input id="bw" type="range" min="14" max="80" value="36"></label>
+  <label title="Length of a short first bar, in beats (0 = none). Detected automatically when possible.">Pickup <input id="pickup" type="number" min="0" step="0.5" value="0" style="width:46px"></label>
+  <span id="tracks" style="display:flex;gap:12px;flex-wrap:wrap"></span>
+  <label>Staff <select id="staff"><option value="lanes">semitone lanes</option><option value="klavar" selected>Klavar</option></select></label>
+  <label title="Fit shrinks the heads so the piece's shortest common notes don't overlap along the time axis">Head size <select id="headsize"><option value="fit" selected>fit to notes</option><option value="full">full</option></select></label>
+  <label>Notehead <select id="heads"><option value="dots">dots</option><option value="shapes" selected>Aikin 7-shape</option></select></label>
+  <label title="Which pitch is do. Auto uses the file's key signature, or the best-fitting major scale.">Do = <select id="key"><option value="auto">auto</option></select></label>
+  <label>Color <select id="colorby"><option value="black" selected>black</option><option value="pitch">by pitch</option><option value="track">by track</option></select></label>
+  <label title="The thin line showing how long each note lasts"><input id="tails" type="checkbox" checked> Duration tails</label>
+  <label title="Colour of the duration tails when noteheads are black, so they stand apart from the staff lines"><input id="tailcolor" type="color" value="#2f7fd8"> Tail colour</label>
+  <label>Paper
+    <select id="paper"><option value="letter">Letter</option><option value="a4">A4</option><option value="legal">Legal</option><option value="tabloid">Tabloid</option><option value="a3">A3</option></select>
+    <select id="porient"><option value="portrait">portrait</option><option value="landscape">landscape</option></select>
+  </label>
+  <label title="Re-flow the bars so each page is filled; untick to keep the on-screen bars per column"><input id="pfit" type="checkbox" checked> Fit to page</label>
+  <label title="Put the staves against the left edge of each page, leaving the right margin blank so pages can overlap on a music stand"><input id="pleft" type="checkbox" checked> Left-align pages</label>
+  <button id="print">Print…</button>
+  <span id="info"></span>
+</header>
+<div id="score"></div>
+<div id="printArea"></div>
+<div class="tip" id="tip"></div>
+
+<script>
+/* ============================================================
+   1. NOTATION DEFINITION  — edit this block to invent your own
+   ============================================================ */
+const NOTATION = {
+  laneHeight: 10,                      // px per semitone row/column
+  systemGap: 36,                       // gap between successive columns (or lines)
+  margin: { left: 50, right: 20, top: 24 },
+
+  // Colour by pitch class (C=0 … B=11): a hue wheel around the circle of fifths
+  pitchColor: pc => d3.hcl((pc * 7 % 12) * 30, 55, 60).formatHex(),
+
+  // Which semitone lanes get shading (here: the black keys)
+  shadedLane: midi => [1, 3, 6, 8, 10].includes(midi % 12),
+
+  // Head radius from velocity (0–1)
+  headRadius: (vel, laneH) => laneH * (0.28 + 0.27 * vel),
+
+  // Glyph per note. Drawn in a local frame where the tail runs along +x;
+  // the renderer rotates the frame so +x points up in vertical mode.
+  drawNote(sel, ctx) {
+    sel.each(function (n) {
+      const g = d3.select(this);
+      const r0 = NOTATION.headRadius(n.velocity, ctx.laneH);
+      const col = ctx.color(n);
+      // half-size of the head: the normal size (from velocity), shrunk if needed so that heads of the
+      // piece's shortest common notes don't overlap along the time axis (ctx.fitHalf, when on)
+      const half0 = ctx.shapes ? Math.min(r0 * 1.45, ctx.laneH * 0.8) : r0;
+      const half = ctx.fitHalf ? Math.min(half0, ctx.fitHalf * (0.8 + 0.2 * n.velocity)) : half0;
+      const r = half;
+      // duration tail: along the time axis, centred on the head (can be switched off)
+      if (ctx.tails) g.append("line").attr("x1", 0).attr("x2", n.w).attr("y1", 0).attr("y2", 0)
+        .attr("stroke", ctx.tailColor || col).attr("stroke-width", Math.max(1.5, half * 0.5)).attr("stroke-linecap", "round")
+        .attr("opacity", ctx.tailColor ? 0.8 : 0.45);
+      // Klavar stem: a bar across the staff, perpendicular to the time axis (horizontal in a vertical
+      // score). n.stem is +1 / -1 / 0 = which way it points; the track's hand decides. It starts at the
+      // middle of the head's onset-side edge (the bottom, in a vertical score) and is stemLength
+      // notehead widths long.
+      const shape = ctx.shapes ? NOTATION.shapes[n.degree] : null;
+      const back = (shape ? (ctx.vertical ? shape.bottom : shape.left) : 1) * half;
+      if (n.stem) g.append("line").attr("x1", -back).attr("x2", -back).attr("y1", 0)
+        .attr("y2", n.stem * NOTATION.stemLength * 2 * half)
+        .attr("stroke", col).attr("stroke-width", 1.6);
+      // The note's frame is rotated in vertical mode, so un-rotate the head to keep shapes upright.
+      const h = g.append("g").attr("transform", ctx.vertical ? "rotate(90)" : null);
+      if (ctx.shapes) {
+        // Aikin 7-shape note: the shape says which scale degree (do … ti) the note is in the key.
+        const k = half;
+        // Fa is a right triangle whose base lies along the stem. Its perpendicular side is on the far
+        // side, out along the stem (the way the stem points), and its acute corner points back the
+        // other way. So it mirrors with the stem direction (left/right in a vertical score, up/down otherwise).
+        let sx = 1, sy = 1;
+        if (n.degree === 3 && n.stem) { if (ctx.vertical) sx = n.stem > 0 ? -1 : 1; else sy = n.stem < 0 ? -1 : 1; }
+        h.append("path").attr("d", shape.d).attr("transform", `scale(${sx * k},${sy * k})`)
+          .attr("fill", col).attr("stroke", n.onDownbeat ? "#222" : col).attr("stroke-width", 1.5)
+          .attr("vector-effect", "non-scaling-stroke")
+          .attr("stroke-dasharray", n.chromatic ? "2 1.5" : null);   // dashed = outside the key
+      } else {
+        const head = n.onDownbeat
+          ? h.append("rect").attr("x", -r).attr("y", -r).attr("width", 2 * r).attr("height", 2 * r)
+          : h.append("circle").attr("r", r);
+        head.attr("fill", n.midi % 12 === 0 ? "#fff" : col).attr("stroke", col).attr("stroke-width", 1.6);
+      }
+    });
+  },
+
+  // Aikin 7-shape heads as unit paths (about -1…1), in scale-degree order.
+  shapes: [
+    { name: "do",  d: "M0,-1 L1,0.8 L-1,0.8 Z", bottom: 0.8, left: 1 },                              // triangle, point up
+    { name: "re",  d: "M-1,-0.5 L1,-0.5 A1,1 0 0 1 -1,-0.5 Z", bottom: 0.5, left: 1 },               // "moon": half-disc, flat side up
+    { name: "mi",  d: "M0,-1 L1,0 L0,1 L-1,0 Z", bottom: 1, left: 1 },                              // diamond
+    { name: "fa",  d: "M-1,-0.9 L-1,0.9 L1,0.9 Z", bottom: 0.9, left: 1 },     // right triangle; mirrored to follow its stem
+    { name: "sol", d: "M-1,0 A1,0.8 0 1 0 1,0 A1,0.8 0 1 0 -1,0 Z", bottom: 0.8, left: 1 },           // oval
+    { name: "la",  d: "M-1,-0.8 L1,-0.8 L1,0.8 L-1,0.8 Z", bottom: 0.8, left: 1 },                    // rectangle
+    { name: "ti",  d: "M0,1 L-1.058,-0.456 A1.8,1.8 0 0 1 1.058,-0.456 Z",     // slice of pie: acute point down, rounded top
+      bottom: 1, left: 1.058 }
+  ],
+  // Klavar staff: where each pitch class sits across the staff, in white-key widths from C
+  // (white keys 1 apart, black keys halfway between their white neighbours)
+  klavarOffset: [0, 0.5, 1, 1.5, 2, 3, 3.5, 4, 4.5, 5, 5.5, 6],
+  stemLength: 3.5,        // stem length, in notehead widths
+  // Line style for each black key (pitch class 1,3 = the pair; 6,8,10 = the triple). Edit to taste.
+  klavarLine: pc => [1, 3].includes(pc) ? { width: 1.8 } : { width: 0.8 },
+  // semitones above do → degree index; notes outside the major scale take the shape of the degree below
+  degreeOf: [0, 0, 1, 1, 2, 3, 3, 4, 4, 5, 5, 6],
+  inScale: [true, false, true, false, true, true, false, true, false, true, false, true]
+};
+
+/* ============================================================
+   2. MIDI / JSON → normalized model
+   ============================================================ */
+const NAMES = ["C","C♯","D","D♯","E","F","F♯","G","G♯","A","A♯","B"];
+const noteName = m => NAMES[m % 12] + (Math.floor(m / 12) - 1);
+
+// Works on a Midi object or on the JSON produced by midi.toJSON()
+function modelFromMidi(midi) {
+  const ppq = midi.header.ppq;
+  // every time-signature event, so bar lines stay right when the meter changes
+  const sigs = (midi.header.timeSignatures || [])
+    .map(s => ({ ticks: s.ticks, num: s.timeSignature[0], den: s.timeSignature[1] }))
+    .sort((a, b) => a.ticks - b.ticks);
+  if (!sigs.length || sigs[0].ticks > 0) sigs.unshift({ ticks: 0, num: 4, den: 4 });
+  const { num, den } = sigs[0];
+  const ticksPerBeat = ppq * 4 / den;          // the first meter's beat sets the horizontal scale
+  // A pickup (anacrusis) can't be read from the file directly, but if the first meter change
+  // doesn't land on a bar line of the first meter, the gap tells us how long the pickup bar is.
+  const firstBar = num * ticksPerBeat;
+  const autoPickup = sigs.length > 1 ? (sigs[1].ticks % firstBar) / ticksPerBeat : 0;
+  const tracks = midi.tracks
+    .map((t, i) => ({ name: t.name || (t.instrument && t.instrument.name) || `Track ${i + 1}`,
+                      notes: t.notes.map(n => ({ midi: n.midi, ticks: n.ticks,
+                                                  dur: n.durationTicks, velocity: n.velocity })) }))
+    .filter(t => t.notes.length);
+  const autoKey = detectKey(midi, tracks);
+  return { ppq, num, den, ticksPerBeat, sigs, autoPickup, tracks, autoKey,
+           meter: [...new Set(sigs.map(s => `${s.num}/${s.den}`))].join(" → "),
+           title: midi.name || (midi.header && midi.header.name) || "Untitled" };
+}
+
+// Which pitch class is "do"? Shape notes use the major scale, and a minor tune uses the same
+// shapes as its relative major (la = the minor tonic), so we only need the major tonic.
+const PC_OF = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+function detectKey(midi, tracks) {
+  const ks = midi.header && midi.header.keySignatures && midi.header.keySignatures[0];
+  if (ks && PC_OF[String(ks.key)[0]] !== undefined) {
+    const k = String(ks.key);
+    const pc = PC_OF[k[0]] + (k.includes("#") ? 1 : 0) - (k.includes("b") ? 1 : 0);
+    return (pc + (ks.scale === "minor" ? 3 : 0) + 12) % 12;
+  }
+  // no key signature in the file: pick the major scale that contains the most (duration-weighted) notes
+  const hist = new Array(12).fill(0);
+  tracks.forEach(t => t.notes.forEach(n => { hist[n.midi % 12] += n.dur; }));
+  const last = tracks.flatMap(t => t.notes).sort((a, b) => (b.ticks + b.dur) - (a.ticks + a.dur))[0];
+  let best = 0, bestScore = -1;
+  for (let t = 0; t < 12; t++) {
+    let s = NOTATION.inScale.reduce((a, inS, i) => a + (inS ? hist[(t + i) % 12] : 0), 0);
+    s += 1e-3 * (hist[t] + hist[(t + 9) % 12]);                          // tie-break: tonic / relative-minor tonic
+    if (last && (last.midi % 12 === t || last.midi % 12 === (t + 9) % 12)) s += 1e-2;  // tunes end on do or la
+    if (s > bestScore) { bestScore = s; best = t; }
+  }
+  return best;
+}
+
+// Bar map: [{start, len, tpb}] in ticks, honouring meter changes and an optional pickup bar.
+function buildBars(m, lastTick, pickupTicks) {
+  const bars = [];
+  let t = 0, si = 0;
+  while (t < lastTick) {
+    while (si + 1 < m.sigs.length && m.sigs[si + 1].ticks <= t) si++;
+    const sg = m.sigs[si], tpb = m.ppq * 4 / sg.den;
+    let len = (bars.length === 0 && pickupTicks > 0) ? pickupTicks : sg.num * tpb;
+    const next = m.sigs[si + 1];
+    if (next && t + len > next.ticks) len = next.ticks - t;      // never straddle a meter change
+    bars.push({ start: t, len, tpb });
+    t += len;
+  }
+  return bars;
+}
+
+function demoModel() {
+  const ppq = 480, seq = [60,62,64,65,67,69,71,72,71,69,67,65,64,62,60,55];
+  const notes = seq.map((m, i) => ({ midi: m, ticks: i * ppq, dur: ppq * 0.9, velocity: 0.4 + (i % 4) * 0.15 }));
+  const bass = [48,48,43,43].map((m, i) => ({ midi: m, ticks: i * ppq * 4, dur: ppq * 3.8, velocity: 0.6 }));
+  return { ppq, num: 4, den: 4, ticksPerBeat: ppq, sigs: [{ ticks: 0, num: 4, den: 4 }], autoPickup: 0, meter: "4/4", autoKey: 0,
+           tracks: [{ name: "Melody", notes }, { name: "Bass", notes: bass }], title: "Demo" };
+}
+
+/* ============================================================
+   3. Layout + render with d3
+   ============================================================ */
+let model = null;
+let layout = null;     // geometry of the last render(), used by the print code
+let bplOverride = null; // lets the print code lay the score out with a different bars-per-column
+let hands = [];         // per track: "R" / "L" = stem side on the Klavar staff, "-" = none
+
+// Default hands: the higher-pitched half of the tracks gets right-hand stems, the lower half left.
+function defaultHands(m) {
+  if (m.tracks.length < 2) return m.tracks.map(() => "-");
+  const avg = m.tracks.map(t => d3.mean(t.notes, n => n.midi));
+  const order = d3.range(m.tracks.length).sort((a, b) => avg[b] - avg[a]);     // highest first
+  const out = [];
+  order.forEach((ti, rank) => { out[ti] = rank < Math.ceil(order.length / 2) ? "R" : "L"; });
+  return out;
+}
+
+function render() {
+  if (!model) return;
+  const N = NOTATION;
+  const vertical = d3.select("#orient").property("value") === "vertical";
+
+  // combine every checked track into one list of notes, tagged with its track index
+  const picked = d3.selectAll("#tracks input:checked").nodes().map(el => +el.value);
+  const track = { notes: picked.flatMap(i => model.tracks[i].notes.map(n => ({ ...n, track: i }))) };
+  if (!track.notes.length) {
+    d3.select("#score").selectAll("*").remove();
+    d3.select("#info").text("No tracks selected");
+    return;
+  }
+  const colorMode = d3.select("#colorby").property("value");     // black | pitch | track
+  const byTrack = colorMode === "track", black = colorMode === "black";
+  const tails = d3.select("#tails").property("checked");
+  const color = n => black ? "#000" : byTrack ? d3.schemeTableau10[n.track % 10] : N.pitchColor(n.midi % 12);
+
+  const barsPerLine = bplOverride || +d3.select("#bpl").property("value");
+  const beatW = +d3.select("#bw").property("value");
+  const px = ticks => ticks / model.ticksPerBeat * beatW;     // ticks → distance along time axis
+
+  // Head-size fit: the shortest note value the piece uses regularly decides how much room each head
+  // has along the time axis. We take the 5th-percentile gap between successive onsets, so a stray
+  // ornament doesn't shrink everything. fitHalf = half the head height that still fits in that gap.
+  const onsets = Array.from(new Set(track.notes.map(n => n.ticks))).sort(d3.ascending);
+  const gaps = d3.pairs(onsets, (a, b) => b - a).sort(d3.ascending);
+  const fitHalf = d3.select("#headsize").property("value") === "fit" && gaps.length
+    ? Math.max(1.5, px(d3.quantile(gaps, 0.05)) / 2 * 0.95) : null;
+
+  const [lo, hi] = d3.extent(track.notes, n => n.midi);
+  const laneH = N.laneHeight;
+  const klavar = d3.select("#staff").property("value") === "klavar";
+  // Pitch geometry, in "lanes". Semitone staff: one lane per semitone. Klavar staff: piano-key geometry,
+  // i.e. white keys one lane apart and each black key half a lane between its white neighbours,
+  // so black lanes overlap the white ones by half and the black-key lines fall between the white notes.
+  const unit = klavar ? laneH * 12 / 7 : laneH;                  // px per lane
+  const posU = m => klavar ? Math.floor(m / 12) * 7 + N.klavarOffset[m % 12] : m;
+  const loU = posU(lo) - 1, hiU = posU(hi) + 1;                  // one lane of padding each side
+  const sysH = (hiU - loU + 1) * unit;                           // extent along the pitch axis
+  const centerOf = m => (posU(m) - loU + 0.5) * unit;            // distance from the low edge
+  const pCenter = m => vertical ? centerOf(m) : sysH - centerOf(m);
+  // every semitone whose lane centre falls inside the drawn range
+  const laneRows = d3.range(lo - 3, hi + 4).filter(m => {
+    const c = centerOf(m); return c >= unit * 0.5 - 1e-6 && c <= sysH - unit * 0.5 + 1e-6;
+  });
+
+  const lastTick = d3.max(track.notes, n => n.ticks + n.dur);
+  const pickup = Math.max(0, +d3.select("#pickup").property("value") || 0) * model.ticksPerBeat;
+  const bars = buildBars(model, lastTick, pickup);
+  const totalBars = bars.length;
+  const nSys = Math.ceil(totalBars / barsPerLine);
+  // each system covers barsPerLine bars; bars differ in length when the meter changes
+  const sysInfo = d3.range(nSys).map(s => {
+    const first = bars[s * barsPerLine], last = bars[Math.min(totalBars, (s + 1) * barsPerLine) - 1];
+    return { startTick: first.start, endTick: last.start + last.len, bars: bars.slice(s * barsPerLine, (s + 1) * barsPerLine) };
+  });
+  const sysLen = d3.max(sysInfo, s => px(s.endTick - s.startTick));  // extent along the time axis
+  const barStarts = bars.map(b => b.start);
+
+  const labelPad = 22;
+  const width = vertical ? N.margin.left + nSys * (sysH + N.systemGap) + N.margin.right
+                         : N.margin.left + sysLen + N.margin.right;
+  const height = vertical ? N.margin.top + sysLen + labelPad
+                          : N.margin.top + nSys * (sysH + N.systemGap);
+
+  // Frame helpers: time runs left→right (horizontal) or bottom→top (vertical)
+  const tPos = t => vertical ? sysLen - t : t;                         // time → coordinate along its axis
+
+  layout = { vertical, nSys, sysH, cell: sysH + N.systemGap, left: N.margin.left, top: N.margin.top,
+             width, height, byTrack, picked, totalBars, barsPerLine, bars, px, shapes: d3.select("#heads").property("value") === "shapes",
+             right: N.margin.right, labelPad, klavar, hands: hands.slice(), black, tails };
+
+  const shapes = d3.select("#heads").property("value") === "shapes";
+  const keyVal = d3.select("#key").property("value");
+  const tonic = keyVal === "auto" ? model.autoKey : +keyVal;       // pitch class that is "do"
+
+  const notes = track.notes.map(n => {
+    const bi = Math.max(0, d3.bisectRight(barStarts, n.ticks) - 1);
+    const sys = Math.floor(bi / barsPerLine);
+    const t = px(n.ticks - sysInfo[sys].startTick);
+    const p = pCenter(n.midi);
+    const rel = ((n.midi - tonic) % 12 + 12) % 12;
+    // stem side comes from the note's track; +1 = right-hand side of the page, -1 = left. In the
+    // horizontal layout pitch rises upward, so "right" (higher) is local -y there.
+    const side = klavar ? ({ R: 1, L: -1 }[hands[n.track]] || 0) : 0;
+    return { ...n, sys, t, stem: vertical ? side : -side, degree: N.degreeOf[rel], chromatic: !N.inScale[rel], w: Math.min(px(n.dur), px(sysInfo[sys].endTick - sysInfo[sys].startTick) - t),
+             x: vertical ? p : t, y: vertical ? tPos(t) : p,
+             onDownbeat: n.ticks === bars[bi].start };
+  });
+
+  d3.select("#score").selectAll("*").remove();
+  const svg = d3.select("#score").append("svg").attr("width", width).attr("height", height);
+
+  const systems = svg.selectAll("g.system").data(d3.range(nSys)).join("g")
+    .attr("class", "system")
+    .attr("transform", s => vertical
+      ? `translate(${N.margin.left + s * (sysH + N.systemGap)},${N.margin.top})`
+      : `translate(${N.margin.left},${N.margin.top + s * (sysH + N.systemGap)})`);
+
+  // semitone staff: shade the black-key lanes
+  systems.selectAll("rect.lane").data(klavar ? [] : laneRows.filter(N.shadedLane)).join("rect")
+    .attr("class", "lane").attr("fill", "#000").attr("opacity", 0.05)
+    .attr("x", m => vertical ? pCenter(m) - unit / 2 : 0).attr("y", m => vertical ? 0 : pCenter(m) - unit / 2)
+    .attr("width", vertical ? unit : sysLen).attr("height", vertical ? sysLen : unit);
+
+  // Klavar staff: a line down the middle of every black-key lane
+  systems.selectAll("line.klavar").data(klavar ? laneRows.filter(N.shadedLane) : []).join("line")
+    .attr("class", "klavar").attr("stroke", "#333").attr("opacity", 0.85)
+    .attr("stroke-width", m => N.klavarLine(m % 12).width)
+    .attr("stroke-dasharray", m => N.klavarLine(m % 12).dash || null)
+    .attr("x1", m => vertical ? pCenter(m) : 0).attr("x2", m => vertical ? pCenter(m) : sysLen)
+    .attr("y1", m => vertical ? 0 : pCenter(m)).attr("y2", m => vertical ? sysLen : pCenter(m));
+
+  // C labels (below the columns when vertical, in the left margin when horizontal)
+  systems.selectAll("text.c").data(laneRows.filter(m => m % 12 === 0)).join("text")
+    .attr("class", "c").attr("font-size", 10).attr("fill", "#888")
+    .attr("text-anchor", vertical ? "middle" : "end")
+    .attr("x", m => vertical ? pCenter(m) : -8)
+    .attr("y", m => vertical ? sysLen + 14 : pCenter(m) + laneH * 0.3)
+    .text(noteName);
+
+  // beat + bar lines, bar numbers
+  systems.each(function (s) {
+    const g = d3.select(this);
+    const si = sysInfo[s];
+    // one grid line per beat of every bar, plus a closing bar line at the end of the system
+    const lines = si.bars.flatMap(b => {
+      const out = [{ pos: px(b.start - si.startTick), bar: true }];
+      for (let k = b.tpb; k < b.len - 1e-6; k += b.tpb) out.push({ pos: px(b.start + k - si.startTick), bar: false });
+      return out;
+    });
+    lines.push({ pos: px(si.endTick - si.startTick), bar: true });
+    g.selectAll("line.grid").data(lines).join("line").attr("class", "grid")
+      .attr("x1", d => vertical ? 0 : d.pos).attr("x2", d => vertical ? sysH : d.pos)
+      .attr("y1", d => vertical ? tPos(d.pos) : 0).attr("y2", d => vertical ? tPos(d.pos) : sysH)
+      .attr("stroke", "#444").attr("stroke-width", d => d.bar ? 1.4 : 0.4).attr("opacity", d => d.bar ? 0.8 : 0.35);
+    g.selectAll("text.barno").data(si.bars).join("text").attr("class", "barno")
+      .attr("font-size", 10).attr("fill", "#777")
+      .attr("text-anchor", vertical ? "end" : "start")
+      .attr("x", b => vertical ? -4 : px(b.start - si.startTick) + 3)
+      .attr("y", b => vertical ? tPos(px(b.start - si.startTick)) - 3 : -3)
+      .text((b, i) => s * barsPerLine + i + 1);
+  });
+
+  // notes (rotated so the duration tail points up in vertical mode)
+  const tip = d3.select("#tip");
+  systems.each(function (s) {
+    d3.select(this).selectAll("g.note").data(notes.filter(n => n.sys === s)).join("g")
+      .attr("class", "note")
+      .attr("transform", n => `translate(${n.x},${n.y})${vertical ? " rotate(-90)" : ""}`)
+      .call(sel => N.drawNote(sel, { laneH, color, vertical, shapes, klavar, tails, fitHalf,
+        tailColor: black ? d3.select("#tailcolor").property("value") : null }))
+      .on("mousemove", (e, n) => tip.style("opacity", 1).style("left", e.clientX + 12 + "px")
+            .style("top", e.clientY + 12 + "px")
+            .text(`${noteName(n.midi)}  vel ${Math.round(n.velocity * 127)}  dur ${(n.dur / model.ticksPerBeat).toFixed(2)} beats`))
+      .on("mouseleave", () => tip.style("opacity", 0));
+  });
+
+  d3.select("#info").text(`${model.title} · ${model.meter} · ${notes.length} notes · ${totalBars} bars`);
+}
+
+/* ============================================================
+   3b. Printing — split the score into pages, one <svg> per page
+   ============================================================ */
+const PAPERS = { letter: [8.5, 11], a4: [8.27, 11.69], legal: [8.5, 14], tabloid: [11, 17], a3: [11.69, 16.54] };
+const PRINT_MARGIN = 0.5;   // inches
+
+// Size (px) of the drawing for B bars per system with k systems on a page
+function pageExtent(L, B, k) {
+  const nSys = Math.ceil(L.totalBars / B);
+  let sysLen = 0;
+  for (let s = 0; s < nSys; s++) {
+    const first = L.bars[s * B], last = L.bars[Math.min(L.totalBars, (s + 1) * B) - 1];
+    sysLen = Math.max(sysLen, L.px(last.start + last.len - first.start));
+  }
+  k = Math.min(k, nSys);
+  return L.vertical
+    ? { nSys, k, w: L.left + k * L.cell, h: L.top + sysLen + L.labelPad }
+    : { nSys, k, w: L.left + sysLen + L.right, h: L.top + k * L.cell };
+}
+
+// Pick (bars per system B, systems per page k). Scale s is inches per drawing-px; the screen view is
+// ~0.0104 in/px, so MIN_SCALE keeps print at roughly two-thirds of screen size or better.
+// Rule: among layouts that are readable, use the fewest pages; then the biggest scale.
+// If the music is too wide to reach MIN_SCALE at all, fall back to the best scale that exists.
+const MIN_SCALE = 0.0072;
+function bestFit(L, areaW, areaH, fixedB) {
+  const all = [];
+  const Bs = fixedB ? [fixedB] : d3.range(1, Math.min(L.totalBars, 64) + 1);
+  for (const B of Bs) {
+    const nSys = Math.ceil(L.totalBars / B);
+    for (let k = 1; k <= nSys; k++) {
+      const e = pageExtent(L, B, k);
+      all.push({ B, k, s: Math.min(areaW / e.w, areaH / e.h), pages: Math.ceil(nSys / k) });
+    }
+  }
+  const floor = Math.min(MIN_SCALE, d3.max(all, d => d.s)) - 1e-9;
+  return all.filter(d => d.s >= floor)
+    .reduce((a, b) => (b.pages < a.pages || (b.pages === a.pages && b.s > a.s + 1e-9)) ? b : a);
+}
+
+function buildPrintPages() {
+  const host = d3.select("#printArea");
+  host.selectAll("*").remove();
+  if (!document.querySelector("#score svg") || !layout) return 0;
+  const N = NOTATION;
+
+  const [pw0, ph0] = PAPERS[d3.select("#paper").property("value")];
+  const land = d3.select("#porient").property("value") === "landscape";
+  const pw = land ? ph0 : pw0, ph = land ? pw0 : ph0;               // inches
+  d3.select("#pagestyle").text(`@page { size: ${pw}in ${ph}in; margin: ${PRINT_MARGIN}in; }`);
+
+  const pageW = pw - 2 * PRINT_MARGIN, pageH = ph - 2 * PRINT_MARGIN - 0.02;  // page box (in)
+  // header + legend height (in): each extra legend line (shapes key, Klavar note) costs a little more
+  const headH = 0.55 + 0.17 * ((layout.shapes ? 1 : 0) + (layout.klavar ? 1 : 0));
+  const areaW = pageW, areaH = pageH - headH;
+
+  // Choose how many bars go in each column/row and how many columns/rows go on a page.
+  // "Fit to page" re-flows the bars to suit the paper; otherwise the on-screen bars-per-column is kept.
+  const fit = d3.select("#pfit").property("checked");
+  const best = bestFit(layout, areaW, areaH, fit ? null : layout.barsPerLine);
+  if (fit && best.B !== layout.barsPerLine) bplOverride = best.B;
+  render();                                   // lay out with the chosen bars-per-column
+  // keep a private copy: the next render() empties #score, including this svg's children
+  const svg = document.querySelector("#score svg").cloneNode(true), L = layout;
+  bplOverride = null; render();               // put the on-screen view back
+  const k = Math.min(best.k, L.nSys), pages = Math.ceil(L.nSys / k);
+
+  const legend = L.black ? [] : L.byTrack
+    ? L.picked.map(i => `<span><i style="background:${d3.schemeTableau10[i % 10]}"></i>${esc(model.tracks[i].name)}${L.klavar && L.hands[i] !== "-" ? " (" + L.hands[i] + ")" : ""}</span>`)
+    : NAMES.map((n, pc) => `<span><i style="background:${N.pitchColor(pc)}"></i>${n}</span>`);
+  if (L.shapes) {
+    const keyName = NAMES[d3.select("#key").property("value") === "auto" ? model.autoKey : +d3.select("#key").property("value")];
+    N.shapes.forEach(s => legend.push(
+      `<span><svg width="13" height="13" viewBox="-1.3 -1.3 2.6 2.6" style="vertical-align:-2px"><path d="${s.d}" fill="#000"/></svg> ${s.name}</span>`));
+    legend.push(`<span>do = ${keyName}${L.black ? "" : " · outlined = downbeat · dashed = outside the key"} · size = velocity${L.tails ? (L.black ? " · coloured line = duration" : " · thin line = duration") : ""}</span>`);
+  } else legend.push(`<span>■ downbeat · ○ hollow = C · size = velocity · tail = duration</span>`);
+  if (L.klavar) {
+    const names = h => L.picked.filter(i => L.hands[i] === h).map(i => i + 1).join(", ") || "none";
+    const [hi, lo] = L.vertical ? ["right", "left"] : ["up", "down"];
+    legend.push(`<span>Klavar: lines = black keys · stem points ${hi} for tracks ${names("R")}, ${lo} for tracks ${names("L")}</span>`);
+  }
+
+  for (let p = 0; p < pages; p++) {
+    const s0 = p * k, s1 = Math.min(L.nSys, s0 + k);
+    const page = host.append("div").attr("class", "page")
+      .style("width", pageW + "in").style("height", pageH + "in");
+    page.append("div").attr("class", "ph").html(
+      `<b>${esc(model.title)}</b><span>${esc(model.meter)} · bars ${s0 * L.barsPerLine + 1}–${Math.min(s1 * L.barsPerLine, L.totalBars)} · page ${p + 1} of ${pages}</span>`);
+    page.append("div").attr("class", "legend").html(legend.join(""));
+
+    const clone = svg.cloneNode(true);
+    clone.querySelectorAll("g.system").forEach((g, i) => { if (i < s0 || i >= s1) g.remove(); });
+    const vb = L.vertical
+      ? [s0 * L.cell, 0, L.left + (s1 - s0) * L.cell, L.height]
+      : [0, s0 * L.cell, L.width, L.top + (s1 - s0) * L.cell];
+    clone.setAttribute("viewBox", vb.join(" "));
+    clone.removeAttribute("width"); clone.removeAttribute("height");
+    clone.setAttribute("preserveAspectRatio", d3.select("#pleft").property("checked") ? "xMinYMin meet" : "xMidYMin meet");
+    // let the page's flex layout give the drawing whatever height the header leaves
+    clone.style.width = "100%"; clone.style.flex = "1 1 0"; clone.style.minHeight = "0";
+    page.node().appendChild(clone);
+  }
+  return pages;
+}
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+/* ============================================================
+   4. Wiring
+   ============================================================ */
+function setModel(m) {
+  model = m;
+  d3.select("#pickup").property("value", m.autoPickup || 0);
+  hands = defaultHands(m);
+  const keyPrev = d3.select("#key").property("value");
+  d3.select("#key").selectAll("option").data(["auto", ...d3.range(12)]).join("option")
+    .attr("value", d => d).text(d => d === "auto" ? `auto (${NAMES[m.autoKey]})` : NAMES[d]);
+  d3.select("#key").property("value", "auto");
+  const box = d3.select("#tracks");
+  box.selectAll("*").remove();
+  m.tracks.forEach((t, i) => {
+    const l = box.append("label").style("display", "flex").style("gap", "4px").style("align-items", "center");
+    l.append("input").attr("type", "checkbox").attr("value", i).property("checked", true).on("change", render);
+    l.append("span").style("width", "10px").style("height", "10px").style("border-radius", "50%")
+      .style("background", d3.schemeTableau10[i % 10]);
+    l.append("span").text(`${i + 1}. ${t.name} (${t.notes.length})`);
+    l.append("select").attr("title", "Stem side on the Klavar staff (the hand)")
+      .on("change", function () { hands[i] = this.value; render(); })
+      .selectAll("option").data([["R", "stem R"], ["L", "stem L"], ["-", "no stem"]]).join("option")
+      .attr("value", d => d[0]).text(d => d[1]).property("selected", d => d[0] === hands[i]);
+  });
+  render();
+}
+async function loadFile(f) {
+  if (!f) return;
+  try {
+    const isJson = /\.json$/i.test(f.name);
+    const m = modelFromMidi(isJson ? JSON.parse(await f.text()) : new Midi(await f.arrayBuffer()));
+    // many files carry no title, so fall back to the file name
+    if (m.title === "Untitled") m.title = f.name.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ").trim() || m.title;
+    setModel(m);
+  }
+  catch (e) { d3.select("#info").text("Could not parse that file: " + e.message); }
+}
+const drop = d3.select("#drop"), fileIn = document.getElementById("file");
+drop.on("click", () => fileIn.click());
+fileIn.addEventListener("change", () => loadFile(fileIn.files[0]));
+drop.on("dragover", e => { e.preventDefault(); drop.classed("over", true); })
+    .on("dragleave", () => drop.classed("over", false))
+    .on("drop", e => { e.preventDefault(); drop.classed("over", false); loadFile(e.dataTransfer.files[0]); });
+d3.select("#demo").on("click", () => setModel(demoModel()));
+// paper orientation follows the score direction until the user chooses otherwise
+d3.select("#orient").on("input.paper", () =>
+  d3.select("#porient").property("value", d3.select("#orient").property("value") === "vertical" ? "portrait" : "landscape"));
+d3.select("#print").on("click", () => { if (buildPrintPages()) window.print(); });
+window.addEventListener("beforeprint", buildPrintPages);   // also covers Ctrl/Cmd+P
+["#bpl", "#bw", "#colorby", "#orient", "#pickup", "#heads", "#key", "#staff", "#tails", "#headsize", "#tailcolor"].forEach(s => d3.select(s).on("input", render));
+setModel(demoModel());
+</script>
+</body>
+</html>
