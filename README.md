@@ -2,6 +2,10 @@
 
 Webpage to convert midi to Klavar notation, written by Claude AI
 
+> **Work in progress.** This is an example/experiment, not a finished product or service.
+> Known gaps: line and page breaks are chosen automatically (no custom phrase breaks yet), and the page needs an
+> internet connection to load its two libraries.
+
 ## Use
 
 Open `midi2klavar.html` in a normal browser (Chrome, Edge, Firefox). It is a single file with no build step,
